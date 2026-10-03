@@ -373,41 +373,124 @@ def extract_profile_updates(message: str) -> dict[str, str]:
     return candidates
 
 
-def summarize_messages(messages: list[dict[str, str]], max_items: int = 6) -> str:
-    """Student TODO: create a compact summary of older messages.
+# Hard cap on the compacted summary. Without it the summary would itself become the
+# unbounded-history problem it exists to solve. It is also capped relative to the
+# configured threshold: a summary that fills the whole budget would leave compaction
+# unable to relieve any pressure, and the thread would keep re-triggering.
+SUMMARY_MAX_CHARS = 1200
+SUMMARY_THRESHOLD_FRACTION = 0.25
 
-    This can be heuristic text concatenation first.
-    Later, you can replace it with an LLM-based summary if desired.
+# Per-message preview length inside a summary line.
+SUMMARY_ITEM_CHARS = 120
+
+
+def summarize_messages(messages: list[dict[str, str]], max_items: int = 6) -> str:
+    """Heuristic compaction of older messages into one line of running context.
+
+    Deliberately not LLM-based: the offline benchmark must be deterministic and free, so
+    this keeps the head and tail of a thread and drops the middle. Each message is reduced
+    to a trimmed single line, which is what stops a 16-turn stress thread from carrying its
+    full text into every later prompt.
     """
 
-    raise NotImplementedError
+    items = [m for m in messages if str(m.get("content", "")).strip()]
+    if not items:
+        return ""
+
+    lines: list[str] = []
+    for message in items:
+        role = "U" if message.get("role") == "user" else "A"
+        body = " ".join(str(message.get("content", "")).split())
+        if len(body) > SUMMARY_ITEM_CHARS:
+            body = body[: SUMMARY_ITEM_CHARS - 3] + "..."
+        lines.append(f"{role}: {body}")
+
+    if len(lines) > max_items:
+        older = lines[: len(lines) - max_items]
+        recent = lines[len(lines) - max_items:]
+        return f"[nén {len(older)} lượt] " + " | ".join(older + ["..."]) + " | giữ gần đây: " + " | ".join(recent)
+    return " | ".join(lines)
 
 
 @dataclass
 class CompactMemoryManager:
-    """Student TODO: implement compact memory for long threads.
+    """Short-term memory that compresses itself when a thread grows too large.
 
-    Goal:
-    - Keep recent messages in full
-    - When the thread grows too large, move older content into a summary
-    - Track how many compactions happened for benchmarking
+    Each thread keeps:
+
+    - ``messages`` — the most recent ``keep_messages`` turns, verbatim
+    - ``summary``  — everything older, compressed into one bounded string
+    - ``compactions`` — how many times compression has fired, for the benchmark
+
+    Compaction is the only mechanism that ever discards history, which keeps "how much
+    context does the agent carry" a single measurable quantity.
     """
 
     threshold_tokens: int
     keep_messages: int
     state: dict[str, dict[str, object]] = field(default_factory=dict)
 
+    def _empty_state(self) -> dict[str, object]:
+        return {
+            "messages": [],
+            "summary": "",
+            "compactions": 0,
+            "total_tokens": 0,       # full history size, drives the compaction trigger
+        }
+
+    def _context_tokens(self, state: dict[str, object]) -> int:
+        """Tokens actually carried into the next prompt: summary plus kept messages."""
+
+        total = estimate_tokens(str(state.get("summary", "")))
+        for message in state["messages"]:          # type: ignore[union-attr]
+            total += estimate_tokens(str(message.get("content", "")))
+        return total
+
+    def _summary_cap(self) -> int:
+        """Summary budget in characters, kept to a fraction of the token threshold.
+
+        Compaction only helps if freeing old messages actually brings the thread back
+        under budget, so the summary may never dominate the threshold.
+        """
+
+        budget = int(self.threshold_tokens * SUMMARY_THRESHOLD_FRACTION * 4)
+        return max(200, min(SUMMARY_MAX_CHARS, budget))
+
     def append(self, thread_id: str, role: str, content: str) -> None:
-        # TODO:
-        # 1. create thread state if missing
-        # 2. append the new message
-        # 3. trigger compaction if needed
-        raise NotImplementedError
+        """Add one message, then compress the thread when its history outgrows the budget.
+
+        ``total_tokens`` tracks the *untrimmed* size of the thread. It is what decides
+        whether a compaction happened, because that is the number the benchmark's
+        "Compactions" column reports and the one that grows without bound if nobody
+        compresses. The retained buffer, meanwhile, is always trimmed to the newest
+        ``keep_messages`` turns so prompt size stays flat.
+        """
+
+        state = self.state.setdefault(thread_id, self._empty_state())
+        messages: list[dict[str, str]] = state["messages"]       # type: ignore[assignment]
+        messages.append({"role": role, "content": content})
+        state["total_tokens"] = int(state["total_tokens"]) + estimate_tokens(content)
+
+        if int(state["total_tokens"]) > self.threshold_tokens:
+            prior = str(state.get("summary", ""))
+            pieces = [{"role": m["role"], "content": m["content"]} for m in messages]
+            if prior:
+                pieces.append({"role": "summary", "content": prior})
+            state["summary"] = summarize_messages(pieces)[-self._summary_cap():]
+            # Reset the budget to what the summary still represents, so the next
+            # compaction happens after genuinely new content rather than immediately.
+            state["total_tokens"] = estimate_tokens(str(state["summary"]))
+            state["compactions"] = int(state["compactions"]) + 1
+
+        if len(messages) > self.keep_messages:
+            messages[:] = messages[-self.keep_messages:]
 
     def context(self, thread_id: str) -> dict[str, object]:
-        # TODO: return per-thread state with keys like messages, summary, compactions.
-        raise NotImplementedError
+        """Return the live per-thread state (``messages``, ``summary``, ``compactions``)."""
+
+        return self.state.setdefault(thread_id, self._empty_state())
 
     def compaction_count(self, thread_id: str) -> int:
-        # TODO: return number of compactions for this thread.
-        raise NotImplementedError
+        """How many times this thread has been compacted."""
+
+        return int(self.state.get(thread_id, {}).get("compactions", 0))    # type: ignore[union-attr]
