@@ -7,6 +7,7 @@ from pathlib import Path
 from agent_advanced import AdvancedAgent
 from agent_baseline import BaselineAgent
 from config import load_config
+from memory_store import UserProfileStore
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
@@ -145,6 +146,71 @@ def test_advanced_admits_when_it_knows_nothing(tmp_path: Path) -> None:
 
 
 # --- Lab-required behaviours ---------------------------------------------------
+
+
+def test_recency_marker_never_leaks_into_facts(tmp_path: Path) -> None:
+    """Internal bookkeeping must not be spoken back to the user or scored as recall."""
+
+    store = UserProfileStore(tmp_path)
+    store.upsert_fact("dungct", "name", "DũngCT")
+    store.touch_fact("dungct", "name")
+
+    facts = store.facts("dungct")
+    assert facts["name"] == "DũngCT", f"marker bị lọt vào value: {facts['name']!r}"
+
+    ranked = dict(store.ranked_facts("dungct"))
+    assert ranked["name"] == "DũngCT"
+
+
+def test_metadata_line_stays_last(tmp_path: Path) -> None:
+    """Facts must be inserted above `_updated`, keeping the file well-formed."""
+
+    store = UserProfileStore(tmp_path)
+    for key in ("name", "location", "profession"):
+        store.upsert_fact("dungct", key, f"v-{key}")
+        store.touch_fact("dungct", key)
+
+    lines = [l for l in store.read_text("dungct").splitlines() if l.strip()]
+    assert lines[-1].startswith("- _updated:"), f"metadata phải ở cuối, thực tế: {lines}"
+
+
+def test_memory_decay_demotes_unmentioned_facts(tmp_path: Path) -> None:
+    """Bonus: a fact nobody repeats should lose priority to a freshly-stated one."""
+
+    store = UserProfileStore(tmp_path)
+    store.upsert_fact("dungct", "interests", "Python")
+    store.touch_fact("dungct", "interests")
+
+    # Three facts arrive without ever mentioning "Python" again.
+    for key in ("drink", "food", "pet"):
+        store.upsert_fact("dungct", key, f"giá trị {key}")
+        store.touch_fact("dungct", key)
+
+    ranked = store.ranked_facts("dungct")
+    keys = [key for key, _ in ranked]
+
+    assert "interests" in keys, "fact cũ vẫn phải còn, chỉ bị giảm ưu tiên"
+    assert keys.index("interests") > keys.index("pet"), \
+        "fact được nhắc gần đây phải đứng trước fact lâu không được nhắc"
+
+
+def test_memory_decay_keeps_most_recent_facts_first(tmp_path: Path) -> None:
+    store = UserProfileStore(tmp_path)
+
+    for index, key in enumerate(["name", "location", "profession", "drink"]):
+        store.upsert_fact("dungct", key, f"v{index}")
+        store.touch_fact("dungct", key)
+
+    ranked = store.ranked_facts("dungct")
+    assert [key for key, _ in ranked][:2] == ["drink", "profession"]
+
+
+def test_merge_fact_values_dedupes_and_preserves_order() -> None:
+    from memory_store import merge_fact_values
+
+    assert merge_fact_values("ngắn gọn", "có ví dụ") == "ngắn gọn, có ví dụ"
+    assert merge_fact_values("ngắn gọn", "ngắn gọn") == "ngắn gọn", "không được lặp lại"
+    assert merge_fact_values("", "Python") == "Python"
 
 
 def test_user_markdown_read_write_edit(tmp_path: Path) -> None:

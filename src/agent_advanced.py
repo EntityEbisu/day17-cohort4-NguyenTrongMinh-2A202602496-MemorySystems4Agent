@@ -146,7 +146,8 @@ class AdvancedAgent:
         """Write extracted facts to User.md.
 
         Additive fields merge; every other field is overwritten, so a correction replaces
-        the stale value instead of sitting beside it.
+        the stale value instead of sitting beside it. Each write is followed by a
+        ``touch_fact`` so memory decay has a recency signal to work with.
         """
 
         facts = self.profile_store.facts(user_id)
@@ -156,6 +157,7 @@ class AdvancedAgent:
                 self.profile_store.upsert_fact(user_id, key, merged)
             else:
                 self.profile_store.upsert_fact(user_id, key, value)
+            self.profile_store.touch_fact(user_id, key)
 
     def _estimate_prompt_context_tokens(self, user_id: str, thread_id: str) -> int:
         """Tokens carried into this turn: User.md + summary + kept messages.

@@ -10,6 +10,16 @@ from pathlib import Path
 # reason about Vietnamese characters.
 FACT_LINE_RE = re.compile(r"^-\s+([A-Za-z0-9_]+)\s*:\s*(.*)$")
 
+# `_seen=<n>` is internal recency bookkeeping written by `touch_fact`. It must never leak
+# into a fact value, or it would be spoken back to the user and corrupt recall scoring.
+SEEN_MARKER_RE = re.compile(r"\s*_seen=\d+\s*$")
+
+
+def _strip_seen(value: str) -> str:
+    """Remove the internal recency marker from a raw fact value."""
+
+    return SEEN_MARKER_RE.sub("", value).strip()
+
 
 def estimate_tokens(text: str) -> int:
     """Heuristic token estimator: roughly ``len(text) / 4`` characters per token.
@@ -46,6 +56,9 @@ class UserProfileStore:
     """
 
     root_dir: Path
+
+    # Class-level monotonic counter backing :meth:`ranked_facts` recency ordering.
+    _counter: int = 0
 
     def path_for(self, user_id: str) -> Path:
         """Map a user id to a single markdown file inside ``root_dir``.
@@ -96,7 +109,8 @@ class UserProfileStore:
             match = FACT_LINE_RE.match(line.strip())
             if not match:
                 continue
-            key, value = match.group(1), match.group(2).strip()
+            key = match.group(1)
+            value = _strip_seen(match.group(2))
             if key.startswith("_") or not value:
                 continue
             parsed[key] = value
@@ -110,25 +124,30 @@ class UserProfileStore:
         """
 
         text = self.read_text(user_id)
-        new_line = f"- {key}: {value}"
 
         lines = text.splitlines()
         for index, line in enumerate(lines):
             match = FACT_LINE_RE.match(line.strip())
             if match and match.group(1) == key:
-                if line.strip() == new_line:
-                    return False
-                lines[index] = new_line
+                current = _strip_seen(match.group(2))
+                if current == value:
+                    return False                      # unchanged
+                lines[index] = f"- {key}: {value}"
                 self._write_lines(user_id, lines)
                 return True
 
-        # Append after the last fact line so the file keeps header, facts, metadata.
-        insert_at = len(lines)
-        for index in range(len(lines) - 1, -1, -1):
-            if FACT_LINE_RE.match(lines[index].strip()):
+        # Insert after the last *fact* line so metadata (`_updated`) always stays last.
+        insert_at = 0
+        for index, line in enumerate(lines):
+            match = FACT_LINE_RE.match(line.strip())
+            if match and not match.group(1).startswith("_"):
                 insert_at = index + 1
-                break
-        lines.insert(insert_at, new_line)
+        if insert_at == 0:
+            # No facts yet: place it after the header and any blank lines.
+            insert_at = len(lines)
+            while insert_at > 0 and not lines[insert_at - 1].strip():
+                insert_at -= 1
+        lines.insert(insert_at, f"- {key}: {value}")
         self._write_lines(user_id, lines)
         return True
 
@@ -138,6 +157,68 @@ class UserProfileStore:
         if "- _updated:" not in body:
             body = body.rstrip() + "\n" + stamp + "\n"
         self.write_text(user_id, body)
+
+    def touch_fact(self, user_id: str, key: str) -> None:
+        """Record that a fact was just mentioned, refreshing its recency.
+
+        This is the bookkeeping behind memory decay: a fact the user keeps repeating stays
+        relevant, while one mentioned once and never again slides down the priority order.
+        """
+
+        path = self.path_for(user_id)
+        if not path.exists():
+            return
+        lines = path.read_text(encoding="utf-8").splitlines()
+        stamp = str(self._tick())
+
+        updated = False
+        for index, line in enumerate(lines):
+            match = FACT_LINE_RE.match(line.strip())
+            if match and match.group(1) == key and not key.startswith("_"):
+                lines[index] = f"{line.rstrip()} _seen={stamp}"
+                updated = True
+                break
+        if updated:
+            self.write_text(user_id, "\n".join(lines).rstrip() + "\n")
+
+    @staticmethod
+    def _tick() -> int:
+        """Monotonic counter for recency ordering, independent of wall-clock dates."""
+
+        UserProfileStore._counter += 1
+        return UserProfileStore._counter
+
+    def ranked_facts(self, user_id: str) -> list[tuple[str, str]]:
+        """Return ``[(key, value)]`` ordered by recency, freshest first.
+
+        Memory decay is applied as *ordering*, not deletion. An old fact is still available
+        — the agent simply mentions it after anything the user has been talking about
+        lately. Deleting instead would silently lose information the user may still care
+        about, which is the failure mode this bonus is meant to avoid.
+        """
+
+        path = self.path_for(user_id)
+        if not path.exists():
+            return []
+
+        entries: list[tuple[int, str, str]] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            match = FACT_LINE_RE.match(line.strip())
+            if not match:
+                continue
+            key = match.group(1)
+            if key.startswith("_"):
+                continue
+            raw = match.group(2)
+            value = _strip_seen(raw)
+            if not value:
+                continue
+            seen = re.search(r"_seen=(\d+)", raw)
+            entries.append((int(seen.group(1)) if seen else -1, key, value))
+
+        # Stable sort on rank keeps file order among facts touched in the same tick.
+        entries.sort(key=lambda item: -item[0])
+        return [(key, value) for _, key, value in entries]
 
 
 # --- Fact extraction vocabulary -------------------------------------------------
