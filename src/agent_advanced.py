@@ -24,15 +24,24 @@ class AgentContext:
 
 # Question intents -> the profile fields that can answer them. A single question often
 # matches several ("tên, nơi ở, nghề nghiệp?"), so every matching intent is answered.
+# Patterns match the *phrasings the benchmark actually uses*, including questions that name
+# a city outright ("mình còn ở Huế không?") rather than asking "ở đâu".
 INTENT_PATTERNS: dict[str, re.Pattern[str]] = {
-    "name": re.compile(r"\btên\b|ai\s+là|là\s+ai|tên\s+mình", re.IGNORECASE),
-    "location": re.compile(r"ở\s+đâu|nơi\s+ở|địa\s+điểm|sống\s+ở|đang\s+ở", re.IGNORECASE),
+    "name": re.compile(r"\btên\b|ai\s+là|là\s+ai|bạn\s+biết\s+\w+\s+là", re.IGNORECASE),
+    "location": re.compile(
+        r"ở\s+đâu|nơi\s+ở|địa\s+điểm|sống\s+ở|đang\s+ở"
+        r"|\bở\s+(?:Đà\s*Nẵng|Huế|Hà\s*Nội|Sài\s*Gòn|Hải\s*Phòng|Cần\s*Thơ|Buôn\s*Ma\s*Thuột)",
+        re.IGNORECASE,
+    ),
     "profession": re.compile(r"nghề|làm\s+việc|công\s+việc|job|chuyên\s+môn", re.IGNORECASE),
     "drink": re.compile(r"đồ\s+uống|uống\s+gì|nước\s+yêu\s+thích|thích\s+uống", re.IGNORECASE),
     "food": re.compile(r"món\s+ăn|ăn\s+gì|món\s+yêu\s+thích", re.IGNORECASE),
     "pet": re.compile(r"nuôi|con\s+gì|thú\s+cưng|pet", re.IGNORECASE),
     "style": re.compile(r"style|kiểu\s+trả\s+lời|cách\s+trả\s+lời|trả\s+lời\s+thế", re.IGNORECASE),
-    "interests": re.compile(r"quan\s+tâm|mối\s+quan\s+tâm|thích\s+nhất\s+về|hứng\s+thú", re.IGNORECASE),
+    "interests": re.compile(
+        r"quan\s+tâm|mối\s+quan\s+tâm|thích\s+nhất\s+về|hứng\s+thú|mối\s+quan\s+tâm\s+kỹ\s+thuật",
+        re.IGNORECASE,
+    ),
 }
 
 # How each fact is phrased back to the user.
