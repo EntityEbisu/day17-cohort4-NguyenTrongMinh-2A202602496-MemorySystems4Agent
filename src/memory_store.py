@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
 
 def estimate_tokens(text: str) -> int:
-    """Student TODO: implement a simple token estimator.
+    """Heuristic token estimator: roughly ``len(text) / 4`` characters per token.
 
-    Example idea:
-    - Strip whitespace
-    - Return 0 for empty text
-    - Approximate tokens from character count, e.g. len(text) / 4
+    Not an exact tokenizer, but stable and deterministic, which is all the offline
+    benchmark needs. Characters are counted, not bytes, so Vietnamese text with
+    multi-byte code points is counted correctly.
     """
 
-    raise NotImplementedError
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return 0
+    return int(math.ceil(len(cleaned) / 4))
 
 
 @dataclass
