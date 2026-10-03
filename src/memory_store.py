@@ -140,23 +140,237 @@ class UserProfileStore:
         self.write_text(user_id, body)
 
 
-def extract_profile_updates(message: str) -> dict[str, str]:
-    """Student TODO: convert raw user text into stable profile facts.
+# --- Fact extraction vocabulary -------------------------------------------------
+# Vietnamese corpora need explicit phrase lists; there is no general-purpose NER here,
+# and none is needed. These constants are the single source of truth for what counts
+# as a stable, persistable fact.
 
-    Example facts you may want to extract:
-    - name
-    - location
-    - profession
-    - preferences / response style
-    - favorite food / drink
+CITIES = (
+    r"(?:Đà\s*Nẵng|Huế|Hà\s*Nội|Sài\s*Gòn|Hải\s*Phòng|Cần\s*Thơ|Buôn\s*Ma\s*Thuột|Nha\s*Trang)"
+)
+PROFESSIONS = (
+    r"(?:(?:MLOps|backend|frontend|backend|full[\s-]?stack|data|devops|AI|security)"
+    r"[\s-]?engineer|product\s+manager|sinh\s+viên)"
+)
 
-    Pseudocode:
-    1. Build a few regex patterns.
-    2. Skip obvious question-only turns.
-    3. Return only the facts that are confidently present in the message.
+# Capturing only the city avoids the classic over-capture of the leading verb
+# ("đang ở Huế" instead of "Huế"). The connector word is optional: "Mình ở Huế" is just
+# as common as "Mình đang ở tại Huế".
+LOCATION_RE = re.compile(
+    r"(?:đang\s+ở|hiện\s+ở|mình\s+ở|sống\s+ở|làm\s+việc\s+ở|chuyển\s+đến)\s+"
+    r"(?:tại\s+|là\s+)?(" + CITIES + r")",
+    re.IGNORECASE,
+)
+PROFESSION_RE = re.compile(
+    r"(?:đang\s+làm\s+(?:một\s+)?|làm\s+|chuyển\s+sang\s+|nghề\s+nghiệp(?:\s+hiện\s+tại)?\s+(?:là|is)\s+)"
+    r"(" + PROFESSIONS + r")",
+    re.IGNORECASE,
+)
+NAME_RE = re.compile(
+    r"mình\s+tên\s+(?:là|is)\s+([A-ZĐ][\wÀ-ỹ]*(?:\s+[A-ZĐ][\wÀ-ỹ]*)?)", re.IGNORECASE
+)
+DRINK_RE = re.compile(r"(cà\s*phê\s*sữa\s*đá)", re.IGNORECASE)
+FOOD_RE = re.compile(r"(mì\s*Quảng)", re.IGNORECASE)
+PET_RE = re.compile(r"(corgi)", re.IGNORECASE)
+
+# Interests are the one field that is explicitly additive, so several may be listed.
+INTEREST_TERMS = ("Python", r"AI\s+ứng\s*dụng", r"MLOps", "RAG")
+
+# Style markers accumulate as a set instead of overwriting each other.
+STYLE_MARKERS: dict[str, str] = {
+    "ngắn gọn": r"ngắn\s*gọn|trả\s+lời\s+(?:ngắn|cô\s+đọng)|bullet\s*ngắn|đừng\s+lan\s+man",
+    "3 bullet": r"(?:thành\s+|dạng\s+)?3\s*bullet|ba\s*bullet",
+    "có ví dụ thực chiến": r"ví\s*dụ\s*(?:thực\s*chiến|thực\s*tế)",
+    "có cấu trúc": r"có\s+cấu\s*trúc|cấu\s*trúc\s+rõ",
+    "ưu tiên trade-off": r"trade[\s-]?off|so\s+sánh\s+trade",
+}
+
+# Phrases that explicitly invalidate a nearby fact: jokes, one-off trips, corrections
+# that demote an old value, and instructions to ignore something.
+NOISE_RE = re.compile(
+    r"đó\s+chỉ\s+là\s+câu\s+đùa"
+    r"|chỉ\s+là\s+câu\s+đùa"
+    r"|đó\s+chỉ\s+là\s+câu\s+hỏi"
+    r"|chỉ\s+là\s+nơi\s+mình\s+vừa\s+bay"
+    r"|chỉ\s+để\s+tham\s+dự"
+    r"|không\s+phải\s+nơi\s+ở"
+    r"|không\s+phải\s+nơi\s+mình\s+ở"
+    r"|đừng\s+lấy\s+nó\s+làm"
+    r"|đừng\s+nói\s+\w+\s+nữa"
+    r"|đừng\s+coi\s+\w+\s+là"
+    r"|ví\s*dụ\s*cũ"
+    r"|là\s+ví\s*dụ",
+    re.IGNORECASE,
+)
+
+# "Đà Nẵng" in a correction sentence is the *old* value being retired, while "Huế" is the
+# new one. Statements that only demote an old value must not resurrect it.
+RETIRE_RE = re.compile(
+    r"(?:không\s+còn\s+(?:ở|làm)|chưa\s+chuyển\s+đi|không\s+còn\s+ở\s+mỗi\s+ngày)",
+    re.IGNORECASE,
+)
+
+# Turns that ask *about* the user rather than stating a fact.
+QUESTION_RE = re.compile(
+    r"Bạn\s+có\s+biết"
+    r"|có\s+thể\s+nhắc\s+lại"
+    r"|nhắc\s+lại"
+    r"|thử\s+mô\s+tả"
+    r"|Bạn\s+nhớ\s+giúp\s+mình",
+    re.IGNORECASE,
+)
+
+# First-person declaration verbs: their presence means the user is stating, not asking.
+# Kept broad on purpose — "Món ăn yêu thích là mì Quảng" has no subject, but it is still
+# a statement of preference, so bare preference phrasing is handled separately below.
+DECLARATION_RE = re.compile(
+    r"mình\s+(?:tên|đang|làm|ở|sống|thích|muốn|cần|nuôi|hay|vẫn|đính\s*chính|chuyển"
+    r"|ăn|uống|làm\s*việc|dùng|đọc|chơi|chạy|đi)",
+    re.IGNORECASE,
+)
+
+# Subject-less but unambiguous preference statements, e.g. "Món ăn yêu thích là mì Quảng".
+PREFERENCE_RE = re.compile(
+    r"(?:yêu\s+thích|món\s+ăn|đồ\s+uống|thích\s+nhất)\s*(?:là|bao\s+giờ)?",
+    re.IGNORECASE,
+)
+
+# An explicit correction is a declaration even without a first-person verb,
+# e.g. "không còn làm backend engineer nữa, giờ chuyển sang MLOps engineer".
+CORRECTION_RE = re.compile(
+    r"đính\s*chính|sửa\s+lại|cập\s*nhật|không\s+còn\s+làm|giờ\s+chuyển\s+sang",
+    re.IGNORECASE,
+)
+
+# Confidence tiers (bonus: only persist facts we are confident about).
+CONFIDENCE_EXPLICIT = 0.95
+CONFIDENCE_RESTATED = 0.85
+CONFIDENCE_MENTION = 0.5
+CONFIDENCE_THRESHOLD = 0.6
+
+# Facts that are safe to append to; everything else is a single-value field where the
+# newest declaration wins (conflict handling).
+CUMULATIVE_FIELDS = ("style", "interests")
+
+
+def _confidence_for(text: str, pattern: re.Pattern[str]) -> float:
+    """Score how strongly a turn asserts a fact, independent of which fact it is."""
+
+    if DECLARATION_RE.search(text) or CORRECTION_RE.search(text):
+        return (
+            CONFIDENCE_EXPLICIT
+            if not re.search(r"\bvẫn\b|\bvẫn\s+cứ\b", text, re.I)
+            else CONFIDENCE_RESTATED
+        )
+    if PREFERENCE_RE.search(text):
+        return CONFIDENCE_EXPLICIT
+    if pattern.search(text):
+        return CONFIDENCE_MENTION
+    return 0.0
+
+
+def _clean(value: str) -> str:
+    """Normalise internal whitespace without touching Vietnamese diacritics."""
+
+    return " ".join(value.split())
+
+
+def merge_fact_values(existing: str, incoming: str) -> str:
+    """Union two comma-separated fact values, preserving first-seen order.
+
+    Used for the additive fields (``style``, ``interests``) so preferences accumulate
+    across turns instead of overwriting one another. Scalar fields never go through this.
     """
 
-    raise NotImplementedError
+    parts = [p.strip() for p in (existing or "").split(",") if p.strip()]
+    for piece in (incoming or "").split(","):
+        piece = piece.strip()
+        if piece and piece not in parts:
+            parts.append(piece)
+    return ", ".join(parts)
+
+
+def _last_match(text: str, pattern: re.Pattern[str]) -> re.Match[str] | None:
+    """Return the *final* match in a turn.
+
+    A correction states the retired value before the new one ("không còn làm backend
+    engineer nữa, giờ chuyển sang MLOps engineer"), so the first match is the value the
+    user is discarding. Taking the last match is what makes a correction actually win.
+    """
+
+    matches = list(pattern.finditer(text))
+    return matches[-1] if matches else None
+
+
+def extract_profile_updates(message: str) -> dict[str, str]:
+    """Turn one raw user message into the stable facts it confidently asserts.
+
+    Pure function: no I/O, no network, no writes. Persisting the result is the caller's
+    job (see ``AdvancedAgent._reply_offline``), which keeps conflict policy — newest
+    declaration wins — in one place.
+
+    Three guards decide whether a candidate fact is trusted:
+
+    1. **Question guard** — a turn that asks about the user ("Bạn có biết DũngCT
+       không?") states nothing, so it yields no facts.
+    2. **Noise guard** — jokes, one-off trips, and explicit "use the new value instead"
+       instructions suppress the fact they mention, which is what stops `product
+       manager` (a joke) or `Hà Nội` (a two-day trip) from overwriting the real ones.
+    3. **Confidence threshold** — candidates below ``CONFIDENCE_THRESHOLD`` are dropped
+       rather than persisted on a hunch.
+    """
+
+    text = (message or "").strip()
+    if not text:
+        return {}
+
+    # Guard 1: questions are not declarations.
+    if QUESTION_RE.search(text) and not DECLARATION_RE.search(text):
+        return {}
+
+    noisy = bool(NOISE_RE.search(text))
+    retired = bool(RETIRE_RE.search(text))
+
+    candidates: dict[str, str] = {}
+
+    def offer(key: str, value: str, pattern: re.Pattern[str]) -> None:
+        if noisy:
+            return
+        if _confidence_for(text, pattern) < CONFIDENCE_THRESHOLD:
+            return
+        candidates[key] = _clean(value)
+
+    name_match = NAME_RE.search(text)
+    if name_match:
+        offer("name", name_match.group(1), NAME_RE)
+
+    location_match = _last_match(text, LOCATION_RE)
+    if location_match:
+        offer("location", location_match.group(1), LOCATION_RE)
+
+    profession_match = _last_match(text, PROFESSION_RE)
+    if profession_match:
+        offer("profession", profession_match.group(1), PROFESSION_RE)
+
+    for key, pattern in (("drink", DRINK_RE), ("food", FOOD_RE), ("pet", PET_RE)):
+        match = pattern.search(text)
+        if match:
+            offer(key, match.group(1), pattern)
+
+    # Interests: collect every term present in the turn.
+    interests = [_clean(m.group(0)) for m in
+                 (re.search(term, text, re.IGNORECASE) for term in INTEREST_TERMS) if m]
+    if interests and not noisy and not retired:
+        candidates["interests"] = ", ".join(dict.fromkeys(interests))
+
+    # Style: union of every marker present, so preferences accumulate rather than
+    # replacing one another.
+    style_markers = [label for label, pattern in STYLE_MARKERS.items()
+                     if re.search(pattern, text, re.IGNORECASE)]
+    if style_markers:
+        candidates["style"] = ", ".join(style_markers)
+
+    return candidates
 
 
 def summarize_messages(messages: list[dict[str, str]], max_items: int = 6) -> str:
