@@ -14,6 +14,9 @@ def test_estimate_tokens_approximates_chars_over_four() -> None:
     assert estimate_tokens("abcdefgh") == 2
 
 
-def test_estimate_tokens_handles_vietnamese() -> None:
-    # 8 chars of multi-byte Vietnamese text must count as 2 tokens, not 8
-    assert estimate_tokens("tiếngViệt") == 2
+def test_estimate_tokens_counts_characters_not_bytes() -> None:
+    # "Đà Nẵng" is 7 characters but 9 UTF-8 bytes. Characters must win (2 tokens),
+    # otherwise every Vietnamese string is silently over-counted.
+    assert len("Đà Nẵng") == 7
+    assert len("Đà Nẵng".encode("utf-8")) == 9
+    assert estimate_tokens("Đà Nẵng") == 2
