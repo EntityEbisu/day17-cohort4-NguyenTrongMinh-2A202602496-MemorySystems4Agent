@@ -45,7 +45,7 @@ Sau khi hoàn thành, các bạn cần có khả năng:
     └── test_agents.py
 ```
 
-Khi chạy, agent sẽ ghi trạng thái (ví dụ `state/profiles/<user>/User.md`) vào thư mục `state/`. Thư mục này đã nằm trong `.gitignore`.
+Khi chạy, agent sẽ ghi trạng thái (ví dụ `state/profiles/<user>.md`) vào thư mục `state/`. Thư mục này đã nằm trong `.gitignore`.
 
 ### Vai trò từng file trong `src/`
 

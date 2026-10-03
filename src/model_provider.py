@@ -5,11 +5,11 @@ from dataclasses import dataclass
 
 @dataclass
 class ProviderConfig:
-    """Student TODO: define the provider configuration shared by the agents.
+    """Provider settings shared by both agents.
 
-    Required providers for this lab:
+    Supported providers:
     - openai
-    - custom (OpenAI-compatible base URL)
+    - custom (OpenAI-compatible base URL, e.g. a local server)
     - gemini
     - anthropic
     - ollama
